@@ -47,29 +47,33 @@ step c = do
 
 -- Assumes execution not completed (head of traces not right)
 stepPop :: MonadSample m => SMCState m a -> m (SMCState m a)
-stepPop (t, z)
-      -- Sample weighted on score, assumes non-empty traces
- = do
-  let resample = logCategorical $ V.map (snd . head) t
+stepPop (t, z) = do
+  traceM $ "-------\nStepPop: length t = " ++ show (V.length t)
+  let resample = logCategorical $ normalizedw t -- normalisation maybe not neccesary
   t' <-
     V.forM t $ \xs -> do
       a <- resample
       traceM $ "StepPop: a = " ++ show a
       let (Left c, w) = head $ t V.! a
-      (c', w') <- step c
-      return $ (c', w * w') : xs
+      traceM $ "StepPop: w = " ++ show w
+      (: xs) <$> step c
+      --traceM $ "StepPop: w' * w = " ++ show (w' * w)
+      --return $ (c', w * w') : xs
+  traceM $ "StepPop: meanw t' = " ++ show (meanw t')
   let z' = z * meanw t'
+  traceM $ "StepPop: z' = " ++ show z'
   return (t', z')
 
 finished :: SMCState m a -> Bool
 finished = isRight . fst . head . V.head . fst
 
-meanw :: V.Vector (Trajectory m a) -> Log Double
-meanw t = V.foldl (\acc ((_, w):_) -> acc + w) 0 t / fromIntegral (V.length t)
-{-
-smc :: MonadSample m => Int -> CSMC m a -> m (SMCState m a)
-smc n model = do
-  let z0 = 1
-      t0 = V.replicate n [(model,1)]
+normalizedw :: V.Vector (Trajectory m a) -> V.Vector (Log Double)
+normalizedw t = V.map (\((_, w):_) -> w / s) t
+  where
+    s = sumw t
 
--}
+sumw :: V.Vector (Trajectory m a) -> Log Double
+sumw = V.foldl (\acc ((_, w):_) -> acc + w) 0
+
+meanw :: V.Vector (Trajectory m a) -> Log Double
+meanw t = sumw t / fromIntegral (V.length t)
