@@ -1,8 +1,14 @@
 module Control.Monad.Bayes.Inference.IPMCMC4
   ( smc
+  , csmc
+  , ipmcmc
+  , IPMCMCResult
   , CSMC
   , SMCState
-  , toPop
+  , Trajectory
+  , ipmcmcAvg
+  , toPopulation
+  , sampleAncestor
   ) where
 
 import           Control.Monad.Bayes.Class
@@ -18,6 +24,7 @@ import           Numeric.Log
 import           Debug.Trace
 
 import           Data.Either
+import           Data.Maybe
 import qualified Data.Vector                                as V
 
 type Trace m a = (Either (CSMC m a) a, Log Double)
@@ -25,10 +32,23 @@ type Trace m a = (Either (CSMC m a) a, Log Double)
 -- List for O(1) cons and head
 type Trajectory m a = [Trace m a]
 
--- Vector for O(1) lookup and update
+-- Vector for O(1) lookup
 type SMCState m a = (V.Vector (Trajectory m a), Log Double)
 
 type CSMC m a = Coroutine (Await ()) (Weighted m) a
+
+data IPMCMCState m a = IPMCMCState
+  { numnodes :: Int
+  , numcond :: Int
+  , nummcmc :: Int
+  --, condIdxs :: V.Vector Int
+  , conds :: V.Vector (Trajectory m a)
+  , result :: [V.Vector a]
+  , smcnode :: m (SMCState m a)
+  , csmcnode :: Trajectory m a -> m (SMCState m a)
+  }
+
+type IPMCMCResult a = [V.Vector a]
 
 instance MonadSample m => MonadSample (Coroutine (Await ()) m) where
   random = lift random
@@ -38,13 +58,61 @@ instance MonadCond m => MonadCond (Coroutine (Await ()) m) where
 
 instance MonadInfer m => MonadInfer (Coroutine (Await ()) m)
 
-smc :: MonadSample m => Int -> CSMC m a -> m (SMCState m a)
-smc n model = smcHelper (V.replicate n [(Left model, 1)], 1)
+ipmcmc :: MonadSample m => Int -> Int -> Int -> CSMC m a -> m (IPMCMCResult a)
+ipmcmc n m r model = do
+  let p = m `div` 2
+      --c = V.enumFromTo 1 p
+      smcnode' = smc n model
+      csmcnode' t = csmc t n model
+  pnodes <- V.replicateM p smcnode'
+  mnodes <- V.replicateM (m-p) smcnode'
+  x' <- mcmcStep pnodes mnodes
+  let res = V.map (fromRight . fst . head) x'
+      state = IPMCMCState m p r x' [res]  smcnode' csmcnode'
+  ipmcmcHelper state
 
-smcHelper :: MonadSample m => SMCState m a -> m (SMCState m a)
-smcHelper state
+ipmcmcHelper :: MonadSample m => IPMCMCState m a -> m (IPMCMCResult a)
+ipmcmcHelper state
+  | nummcmc state <= 0 = return $ result state
+  | otherwise = do
+      pnodes <- V.forM (conds state) $ csmcnode state
+      mnodes <- V.replicateM (numnodes state - numcond state) $ smcnode state
+      x' <- mcmcStep pnodes mnodes
+      let res = V.map (fromRight . fst . head) x' : result state
+          nextr = nummcmc state - 1
+          state' = state {nummcmc = nextr, conds = x', result = res}
+      ipmcmcHelper state'
+
+mcmcStep :: MonadSample m => V.Vector (SMCState m a) -> V.Vector (SMCState m a) -> m (V.Vector (Trajectory m a))
+mcmcStep pnodes mnodes = do
+  let sumzm = V.sum $ V.map snd mnodes
+      weightsm = V.map (flip (/) sumzm . snd) mnodes
+  V.forM pnodes $ \(t,z) -> do
+    let weights = V.cons (z / (z + sumzm)) $ V.map (\x -> recip $ recip x + z / (x * sumzm)) weightsm
+    ksi <- logCategorical weights
+    let trajectory = maybe t fst $ mnodes V.!? ksi
+    b <- logCategorical $ normalizedw trajectory
+    return $ trajectory V.! b
+
+csmc :: MonadSample m => Trajectory m a -> Int -> CSMC m a -> m (SMCState m a)
+csmc x' n model =
+  csmcHelper (Just ([], reverse x')) (V.replicate n [(Left model, 1)], 1)
+
+csmcHelper ::
+     MonadSample m
+  => Maybe (Trajectory m a, Trajectory m a)
+  -> SMCState m a
+  -> m (SMCState m a)
+csmcHelper x state
   | finished state = return state
-  | otherwise = stepPop state >>= smcHelper
+  | otherwise = stepPop (fmap fst nextx) state >>= csmcHelper nextx
+  where
+    nextx = do
+      (current, rh:rest) <- x
+      return (rh : current, rest)
+
+smc :: MonadSample m => Int -> CSMC m a -> m (SMCState m a)
+smc n model = csmcHelper Nothing (V.replicate n [(Left model, 1)], 1)
 
 step :: MonadSample m => CSMC m a -> m (Trace m a)
 step c = do
@@ -53,29 +121,15 @@ step c = do
   return (c', w)
 
 -- Assumes execution not completed (head of traces not right)
-stepPop :: MonadSample m => SMCState m a -> m (SMCState m a)
-stepPop (t, z)
-  --traceM $ "--- StepPop, step = " ++ show (length $ V.head t)
-  --traceM $ "z = " ++ show z
-  --traceM $ "length t = " ++ show (V.length t)
-  -- TODO: Possibly replace with mutation in ST
- = do
+stepPop ::
+     MonadSample m => Maybe (Trajectory m a) -> SMCState m a -> m (SMCState m a)
+stepPop x' (t, z) = do
   t' <-
-    V.replicateM (V.length t) $
-    --V.forM (V.zip t (V.enumFromTo 0 (V.length t - 1))) $ \(_, i)
-      --traceM $ "------ Loop = " ++ show i
-     -- -> do
-     do
-      ancestor <- sampleAncestor t
-      --traceM $ "a = " ++ show a
+    V.replicateM (V.length t) $ do
+      ancestor <- sampleAncestorWith x' t
       let (Left c, _) = head ancestor
-      --traceM $ "w = " ++ show w
       (: ancestor) <$> step c
-  --traceM $ "------"
-  --traceM $ "meanw t' = " ++ show (meanw t')
   let z' = z * meanw t'
-  --traceM $ "z' = " ++ show z'
-  --traceM $ "---"
   return (t', z')
 
 -- Only checks first trace for finished.
@@ -84,9 +138,16 @@ finished :: SMCState m a -> Bool
 finished = isRight . fst . head . V.head . fst
 
 normalizedw :: V.Vector (Trajectory m a) -> V.Vector (Log Double)
-normalizedw t = V.map (\((_, w):_) -> w / s) t
+normalizedw = normalizedwWith Nothing
+
+normalizedwWith ::
+     Maybe (Trajectory m a)
+  -> V.Vector (Trajectory m a)
+  -> V.Vector (Log Double)
+normalizedwWith x' t = maybe a (flip V.cons a . flip (/) s . snd . head) x'
   where
-    s = sumw t
+    s = sumw t + maybe 0 (snd . head) x'
+    a = V.map (\((_, w):_) -> w / s) t
 
 sumw :: V.Vector (Trajectory m a) -> Log Double
 sumw = V.foldl (\acc ((_, w):_) -> acc + w) 0
@@ -95,8 +156,8 @@ meanw :: V.Vector (Trajectory m a) -> Log Double
 meanw t = sumw t / fromIntegral (V.length t)
 
 -- Assumes last trace is a value
-toPop :: Monad m => m (SMCState m a) -> P.Population m a
-toPop state = P.fromWeightedList weights
+toPopulation :: Monad m => m (SMCState m a) -> P.Population m a
+toPopulation state = P.fromWeightedList weights
   where
     weights = fmap (V.toList . V.map f . fst) state
     f xs = (value xs, total xs)
@@ -104,8 +165,26 @@ toPop state = P.fromWeightedList weights
     value _                = error "Last trace not Right"
     total = product . map snd
 
+sampleAncestorWith ::
+     MonadSample m
+  => Maybe (Trajectory m a)
+  -> V.Vector (Trajectory m a)
+  -> m (Trajectory m a)
+sampleAncestorWith x' t = do
+  let weights = normalizedwWith x' t
+  b <- logCategorical weights
+  return $ maybe t (`V.cons` t) x' V.! b
+
 sampleAncestor ::
      MonadSample m => V.Vector (Trajectory m a) -> m (Trajectory m a)
-sampleAncestor t = do
-  b <- logCategorical $ normalizedw t
-  return $ t V.! b
+sampleAncestor = sampleAncestorWith Nothing
+
+fromRight :: Either a b -> b
+fromRight (Right x) = x
+fromRight _ = error "Coroutine not finished (nor Right)"
+
+ipmcmcAvg :: (a -> Double) -> IPMCMCResult a -> Double
+ipmcmcAvg f res = flip (/) (r * p) $ foldl (\acc v -> acc + V.foldl (\acc' x -> acc' + f x) 0 v) 0 res
+  where
+    r = fromIntegral $ length res
+    p = fromIntegral $ V.length $ head res
