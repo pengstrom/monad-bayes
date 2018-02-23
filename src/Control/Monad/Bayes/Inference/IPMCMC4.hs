@@ -75,6 +75,7 @@ ipmcmcHelper :: MonadSample m => IPMCMCState m a -> m (IPMCMCResult a)
 ipmcmcHelper state
   | nummcmc state <= 0 = return $ result state
   | otherwise = do
+      --traceM $ "MCMC iteration = " ++ show (nummcmc state)
       pnodes <- V.forM (conds state) $ csmcnode state
       mnodes <- V.replicateM (numnodes state - numcond state) $ smcnode state
       x' <- mcmcStep pnodes mnodes
@@ -117,6 +118,7 @@ smc n model = csmcHelper Nothing (V.replicate n [(Left model, 1)], 1)
 step :: MonadSample m => CSMC m a -> m (Trace m a)
 step c = do
   (cont, w) <- runWeighted $ resume c
+  --traceM $ "Step: w = " ++ show w
   let c' = either (\(Await f) -> Left $ f ()) Right cont
   return (c', w)
 
@@ -124,11 +126,16 @@ step c = do
 stepPop ::
      MonadSample m => Maybe (Trajectory m a) -> SMCState m a -> m (SMCState m a)
 stepPop x' (t, z) = do
+  let n = V.length t
   t' <-
-    V.replicateM (V.length t) $ do
+    V.replicateM n $ do
       ancestor <- sampleAncestorWith x' t
-      let (Left c, _) = head ancestor
-      (: ancestor) <$> step c
+      let Left c = fst $ head ancestor
+      (c', w') <- step c
+      let nextw = w' * sumw t / fromIntegral n
+      --traceM $ "StepPop: w' = " ++ show w'
+      --traceM $ "StepPop: w' * sumw t / n = " ++ show nextw
+      return $ (c', nextw) : ancestor
   let z' = z * meanw t'
   return (t', z')
 
@@ -181,7 +188,7 @@ sampleAncestor = sampleAncestorWith Nothing
 
 fromRight :: Either a b -> b
 fromRight (Right x) = x
-fromRight _ = error "Coroutine not finished (nor Right)"
+fromRight _ = error "Coroutine not finished (not Right)"
 
 ipmcmcAvg :: (a -> Double) -> IPMCMCResult a -> Double
 ipmcmcAvg f res = flip (/) (r * p) $ foldl (\acc v -> acc + V.foldl (\acc' x -> acc' + f x) 0 v) 0 res
