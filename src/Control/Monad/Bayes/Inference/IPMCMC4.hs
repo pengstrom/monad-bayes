@@ -13,7 +13,6 @@ module Control.Monad.Bayes.Inference.IPMCMC4
 
 import           Control.Monad.Bayes.Class
 import qualified Control.Monad.Bayes.Population             as P
-import           Control.Monad.Bayes.Weighted
 import           Control.Monad.Coroutine
 import           Control.Monad.Coroutine.SuspensionFunctors
 
@@ -21,13 +20,16 @@ import           Control.Monad.Trans
 
 import           Numeric.Log
 
-import           Debug.Trace
-
 import           Data.Either
-import           Data.Maybe
 import qualified Data.Vector                                as V
 
 type Trace m a = (Either (CSMC m a) a, Log Double)
+
+traceCont :: Trace m a -> Either (CSMC m a) a
+traceCont = fst
+
+traceWeight :: Trace m a -> Log Double
+traceWeight = snd
 
 -- List for O(1) cons and head
 type Trajectory m a = [Trace m a]
@@ -35,7 +37,7 @@ type Trajectory m a = [Trace m a]
 -- Vector for O(1) lookup
 type SMCState m a = (V.Vector (Trajectory m a), Log Double)
 
-type CSMC m a = Coroutine (Await ()) (Weighted m) a
+type CSMC m a = Coroutine (Yield (Log Double))  m a
 
 data IPMCMCState m a = IPMCMCState
   { numnodes :: Int
@@ -50,13 +52,13 @@ data IPMCMCState m a = IPMCMCState
 
 type IPMCMCResult a = [V.Vector a]
 
-instance MonadSample m => MonadSample (Coroutine (Await ()) m) where
+instance MonadSample m => MonadSample (Coroutine (Yield (Log Double)) m) where
   random = lift random
 
-instance MonadCond m => MonadCond (Coroutine (Await ()) m) where
-  score w = lift (score w) >> await
+instance Monad m => MonadCond (Coroutine (Yield (Log Double)) m) where
+  score = yield
 
-instance MonadInfer m => MonadInfer (Coroutine (Await ()) m)
+instance MonadSample m => MonadInfer (Coroutine (Yield (Log Double)) m)
 
 ipmcmc :: MonadSample m => Int -> Int -> Int -> CSMC m a -> m (IPMCMCResult a)
 ipmcmc n m r model = do
@@ -117,24 +119,21 @@ smc n model = csmcHelper Nothing (V.replicate n [(Left model, 1)], 1)
 
 step :: MonadSample m => CSMC m a -> m (Trace m a)
 step c = do
-  (cont, w) <- runWeighted $ resume c
-  --traceM $ "Step: w = " ++ show w
-  let c' = either (\(Await f) -> Left $ f ()) Right cont
-  return (c', w)
+  cont <- resume c
+  return $ either (\(Yield w c') -> (Left c', w)) (\x -> (Right x, 1)) cont
 
 -- Assumes execution not completed (head of traces not right)
 stepPop ::
      MonadSample m => Maybe (Trajectory m a) -> SMCState m a -> m (SMCState m a)
 stepPop x' (t, z) = do
   let n = V.length t
+      w = sumw t / fromIntegral n
   t' <-
     V.replicateM n $ do
       ancestor <- sampleAncestorWith x' t
-      let Left c = fst $ head ancestor
+      let (Left c, _) = head ancestor
       (c', w') <- step c
-      let nextw = w' * sumw t / fromIntegral n
-      --traceM $ "StepPop: w' = " ++ show w'
-      --traceM $ "StepPop: w' * sumw t / n = " ++ show nextw
+      let nextw = w' * w
       return $ (c', nextw) : ancestor
   let z' = z * meanw t'
   return (t', z')
@@ -143,21 +142,6 @@ stepPop x' (t, z) = do
 -- Assumes the same number of observations on every execution path
 finished :: SMCState m a -> Bool
 finished = isRight . fst . head . V.head . fst
-
-normalizedw :: V.Vector (Trajectory m a) -> V.Vector (Log Double)
-normalizedw = normalizedwWith Nothing
-
-normalizedwWith ::
-     Maybe (Trajectory m a)
-  -> V.Vector (Trajectory m a)
-  -> V.Vector (Log Double)
-normalizedwWith x' t = maybe a (flip V.cons a . flip (/) s . snd . head) x'
-  where
-    s = sumw t + maybe 0 (snd . head) x'
-    a = V.map (\((_, w):_) -> w / s) t
-
-sumw :: V.Vector (Trajectory m a) -> Log Double
-sumw = V.foldl (\acc ((_, w):_) -> acc + w) 0
 
 meanw :: V.Vector (Trajectory m a) -> Log Double
 meanw t = sumw t / fromIntegral (V.length t)
@@ -170,7 +154,7 @@ toPopulation state = P.fromWeightedList weights
     f xs = (value xs, total xs)
     value ((Right x, _):_) = x
     value _                = error "Last trace not Right"
-    total = product . map snd
+    total = snd . head
 
 sampleAncestorWith ::
      MonadSample m
@@ -180,11 +164,27 @@ sampleAncestorWith ::
 sampleAncestorWith x' t = do
   let weights = normalizedwWith x' t
   b <- logCategorical weights
-  return $ maybe t (`V.cons` t) x' V.! b
+  return $ maybe t (flip V.cons t) x' V.! b
 
 sampleAncestor ::
      MonadSample m => V.Vector (Trajectory m a) -> m (Trajectory m a)
 sampleAncestor = sampleAncestorWith Nothing
+
+normalizedw :: V.Vector (Trajectory m a) -> V.Vector (Log Double)
+normalizedw = normalizedwWith Nothing
+
+normalizedwWith ::
+     Maybe (Trajectory m a)
+  -> V.Vector (Trajectory m a)
+  -> V.Vector (Log Double)
+normalizedwWith x' t = maybe a (flip V.cons a . flip (/) s . getWeight) x'
+  where
+    getWeight = traceWeight . head
+    s = sumw t + maybe 0 getWeight x'
+    a = V.map (flip (/) s . getWeight) t
+
+sumw :: V.Vector (Trajectory m a) -> Log Double
+sumw = V.foldl (\acc ((_, w):_) -> acc + w) 0
 
 fromRight :: Either a b -> b
 fromRight (Right x) = x
