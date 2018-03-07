@@ -28,11 +28,22 @@ import Control.Monad.State (State, state)
 import Control.Monad.Trans (lift, MonadIO)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT, ask, mapReaderT)
 
+import Control.Monad (liftM)
+
+import Control.Monad.Parallel
+
 import Control.Monad.Bayes.Class
 
 -- | An `IO` based random sampler using the MWC-Random package.
-newtype SamplerIO a = SamplerIO (ReaderT GenIO IO a)
+newtype SamplerIO a = SamplerIO {runSamplerIO :: ReaderT GenIO IO a}
   deriving(Functor, Applicative, Monad, MonadIO)
+
+instance MonadParallel SamplerIO where
+  bindM2 f ma mb = SamplerIO $ bindM2 f' (runSamplerIO ma) (runSamplerIO mb)
+    where f' a b = runSamplerIO $ f a b
+
+instance MonadFork SamplerIO where
+  forkExec ma = SamplerIO $ fmap SamplerIO $ forkExec $ runSamplerIO ma
 
 -- | Initialize PRNG using OS-supplied randomness.
 -- For efficiency this operation should be applied at the very end, ideally once per program.

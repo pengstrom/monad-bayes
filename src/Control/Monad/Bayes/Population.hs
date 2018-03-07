@@ -43,6 +43,8 @@ import Numeric.Log
 import Control.Monad.Bayes.Class
 import Control.Monad.Bayes.Weighted hiding (flatten, hoist)
 
+import Debug.Trace
+
 newtype Population m a = Population (Weighted (ListT m) a)
   deriving(Functor,Applicative,Monad,MonadIO,MonadSample,MonadCond,MonadInfer)
 
@@ -77,6 +79,7 @@ resampleGeneric resampler m = fromWeightedList $ do
   let n = length xs
   let z = sum ps
   if z > 0 then do
+    --traceM $ "MultWeights: " ++ show ps
     let weights = V.fromList (map (exp . ln . (/z)) ps)
     ancestors <- resampler weights
     let xvec = V.fromList xs

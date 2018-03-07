@@ -27,6 +27,7 @@ import Data.Either
 
 import Control.Monad.Bayes.Class
 
+import Debug.Trace
 -- | Represents a computation that can be suspended at certain points.
 -- The intermediate monadic effects can be extracted, which is particularly useful
 -- for implementation of SMC-related methods.

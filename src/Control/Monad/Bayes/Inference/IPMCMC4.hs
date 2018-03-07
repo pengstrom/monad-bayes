@@ -1,14 +1,14 @@
 module Control.Monad.Bayes.Inference.IPMCMC4
-  ( smc
-  , csmc
-  , ipmcmc
-  , IPMCMCResult
-  , CSMC
-  , SMCState
+  ( CSMC
+  , Trace
   , Trajectory
+  , IPMCMCResult
+  , SMCState
+  , ipmcmc
+  , smc
+  , csmc
   , ipmcmcAvg
   , toPopulation
-  , sampleAncestor
   ) where
 
 import           Control.Monad.Bayes.Class
@@ -23,7 +23,18 @@ import           Numeric.Log
 import           Data.Either
 import qualified Data.Vector                                as V
 
-type Trace m a = (Either (CSMC m a) a, Log Double)
+import Control.Monad.Parallel as MP
+
+import Debug.Trace
+import Data.Time.Clock.System
+
+import Control.Monad (when)
+
+-- | Snapshot of program execution in time.
+-- Pair of rest of program (or result) and weight at this time.
+type Trace m a =
+  ( Either (CSMC m a) a
+  , Log Double)
 
 traceCont :: Trace m a -> Either (CSMC m a) a
 traceCont = fst
@@ -31,25 +42,30 @@ traceCont = fst
 traceWeight :: Trace m a -> Log Double
 traceWeight = snd
 
--- List for O(1) cons and head
+-- | The particle trajectory
 type Trajectory m a = [Trace m a]
 
--- Vector for O(1) lookup
-type SMCState m a = (V.Vector (Trajectory m a), Log Double)
+-- | SMC state.
+-- Pair of all trajectories and estimated marginal likelihood.
+type SMCState m a = 
+  ( V.Vector (Trajectory m a)
+  , Log Double) 
 
+-- | Suspendable execution yielding the score.
 type CSMC m a = Coroutine (Yield (Log Double))  m a
 
+-- | Internals of iPMCMC
 data IPMCMCState m a = IPMCMCState
-  { numnodes :: Int
-  , numcond :: Int
-  , nummcmc :: Int
-  --, condIdxs :: V.Vector Int
-  , conds :: V.Vector (Trajectory m a)
-  , result :: [V.Vector a]
-  , smcnode :: m (SMCState m a)
-  , csmcnode :: Trajectory m a -> m (SMCState m a)
+  { numnodes :: Int -- ^ Number of total nodes M
+  , numcond :: Int -- ^ Number of conditional nodes P
+  , nummcmc :: Int -- ^ Number of (remaining) MCMC iterations
+  , conds :: V.Vector (Trajectory m a) -- ^ Collected conditional trajectories of last iteration
+  , result :: IPMCMCResult a -- ^ Accumulated conditional trajectories
+  , smcnode :: m (SMCState m a) -- ^ Alias for running unconditional SMC on model
+  , csmcnode :: Trajectory m a -> m (SMCState m a) -- ^ Alias for running conditional SMC on model
   }
 
+-- | All conditional trajectories from all iterations
 type IPMCMCResult a = [V.Vector a]
 
 instance MonadSample m => MonadSample (Coroutine (Yield (Log Double)) m) where
@@ -60,26 +76,39 @@ instance Monad m => MonadCond (Coroutine (Yield (Log Double)) m) where
 
 instance MonadSample m => MonadInfer (Coroutine (Yield (Log Double)) m)
 
-ipmcmc :: MonadSample m => Int -> Int -> Int -> CSMC m a -> m (IPMCMCResult a)
+-- | Interacting Particle Markov Chain Monte Carlo sampler.
+-- Assumes all execution paths of the model contains the same number of scorings.
+-- Results are (at least explicitly) unweighted.
+-- The value M/2 is used for the number of conditional nodes.
+-- No Rao-Blackwell normalization.
+ipmcmc :: (MonadParallel m, MonadSample m, MonadIO m)
+  => Int -- ^ Number of SMC particles per node N
+  -> Int -- ^ Number of nodes M
+  -> Int -- ^ Number of MCMC iterations
+  -> CSMC m a -- ^ Model
+  -> m (IPMCMCResult a)
 ipmcmc n m r model = do
   let p = m `div` 2
-      --c = V.enumFromTo 1 p
       smcnode' = smc n model
       csmcnode' t = csmc t n model
-  pnodes <- V.replicateM p smcnode'
-  mnodes <- V.replicateM (m-p) smcnode'
+  logtime
+  pnodes <- V.fromList <$> MP.replicateM p     smcnode'
+  mnodes <- V.fromList <$> MP.replicateM (m-p) smcnode'
   x' <- mcmcStep pnodes mnodes
   let res = V.map (fromRight . fst . head) x'
       state = IPMCMCState m p r x' [res]  smcnode' csmcnode'
   ipmcmcHelper state
 
-ipmcmcHelper :: MonadSample m => IPMCMCState m a -> m (IPMCMCResult a)
+ipmcmcHelper :: (MonadIO m, MonadParallel m, MonadSample m) => IPMCMCState m a -> m (IPMCMCResult a)
 ipmcmcHelper state
-  | nummcmc state <= 0 = return $ result state
-  | otherwise = do
-      --traceM $ "MCMC iteration = " ++ show (nummcmc state)
-      pnodes <- V.forM (conds state) $ csmcnode state
-      mnodes <- V.replicateM (numnodes state - numcond state) $ smcnode state
+    | nummcmc state <= 0 = return $ result state
+    | otherwise = do
+      let p = numcond state
+          nonp = numnodes state - p
+      logtime
+      pnodes <- V.fromList <$> MP.forM (V.toList $ conds state) (csmcnode state)
+      mnodes <- V.fromList <$> MP.replicateM nonp (smcnode state)
+      --traceM $ "MCMC step = " ++ show (nummcmc state)
       x' <- mcmcStep pnodes mnodes
       let res = V.map (fromRight . fst . head) x' : result state
           nextr = nummcmc state - 1
@@ -97,7 +126,15 @@ mcmcStep pnodes mnodes = do
     b <- logCategorical $ normalizedw trajectory
     return $ trajectory V.! b
 
-csmc :: MonadSample m => Trajectory m a -> Int -> CSMC m a -> m (SMCState m a)
+-- | Conditional Sequential Markov Chain sampler.
+-- Uses multinomial resampling.
+-- Retains all trajectories unlike 'smcMultinomial' and the like.
+-- Conditional on given trajectory
+csmc :: MonadSample m
+  => Trajectory m a -- ^ Conditional trajectory
+  -> Int -- ^ Number of particles N
+  -> CSMC m a -- ^ Model
+  -> m (SMCState m a)
 csmc x' n model =
   csmcHelper (Just ([], reverse x')) (V.replicate n [(Left model, 1)], 1)
 
@@ -114,7 +151,13 @@ csmcHelper x state
       (current, rh:rest) <- x
       return (rh : current, rest)
 
-smc :: MonadSample m => Int -> CSMC m a -> m (SMCState m a)
+-- | Sequential Markov Chain sampler.
+-- Uses multinomial resampling.
+-- Retains all trajectories unlike 'smcMultinomial' and the like.
+smc :: MonadSample m
+  => Int -- ^ Number of particles N
+  -> CSMC m a -- ^ Model
+  -> m (SMCState m a)
 smc n model = csmcHelper Nothing (V.replicate n [(Left model, 1)], 1)
 
 step :: MonadSample m => CSMC m a -> m (Trace m a)
@@ -122,21 +165,26 @@ step c = do
   cont <- resume c
   return $ either (\(Yield w c') -> (Left c', w)) (\x -> (Right x, 1)) cont
 
--- Assumes execution not completed (head of traces not right)
+-- Assumes execution not completed (head of traces not right).
 stepPop ::
      MonadSample m => Maybe (Trajectory m a) -> SMCState m a -> m (SMCState m a)
 stepPop x' (t, z) = do
   let n = V.length t
       w = sumw t / fromIntegral n
   t' <-
-    V.replicateM n $ do
-      ancestor <- sampleAncestorWith x' t
+    V.forM (V.enumFromTo 0 (n-1)) $ \i -> do
+      let sampler = if nonzero t then sampleAncestorWith x' t else return (t V.! i)
+      ancestor <- sampler
       let (Left c, _) = head ancestor
       (c', w') <- step c
       let nextw = w' * w
       return $ (c', nextw) : ancestor
   let z' = z * meanw t'
   return (t', z')
+
+nonzero :: V.Vector (Trajectory m a) -> Bool
+nonzero = not . V.all (0 ==) . getWeights
+  where getWeights = V.map (traceWeight . head)
 
 -- Only checks first trace for finished.
 -- Assumes the same number of observations on every execution path
@@ -146,7 +194,7 @@ finished = isRight . fst . head . V.head . fst
 meanw :: V.Vector (Trajectory m a) -> Log Double
 meanw t = sumw t / fromIntegral (V.length t)
 
--- Assumes last trace is a value
+-- | Convert the result from 'ipmcmc' to a 'Population'
 toPopulation :: Monad m => m (SMCState m a) -> P.Population m a
 toPopulation state = P.fromWeightedList weights
   where
@@ -164,7 +212,7 @@ sampleAncestorWith ::
 sampleAncestorWith x' t = do
   let weights = normalizedwWith x' t
   b <- logCategorical weights
-  return $ maybe t (flip V.cons t) x' V.! b
+  return $ maybe t (`V.cons` t) x' V.! b
 
 sampleAncestor ::
      MonadSample m => V.Vector (Trajectory m a) -> m (Trajectory m a)
@@ -190,8 +238,14 @@ fromRight :: Either a b -> b
 fromRight (Right x) = x
 fromRight _ = error "Coroutine not finished (not Right)"
 
+-- | Estimate the expected value of a function 'f' using the result of 'ipmcmc'.
 ipmcmcAvg :: (a -> Double) -> IPMCMCResult a -> Double
 ipmcmcAvg f res = flip (/) (r * p) $ foldl (\acc v -> acc + V.foldl (\acc' x -> acc' + f x) 0 v) 0 res
   where
     r = fromIntegral $ length res
     p = fromIntegral $ V.length $ head res
+
+logtime :: MonadIO m => m ()
+logtime = do
+  (MkSystemTime secs msecs) <- liftIO getSystemTime
+  liftIO $ putStrLn $ show secs ++ "." ++ show msecs

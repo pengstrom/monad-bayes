@@ -8,5 +8,10 @@ packages:
 #     - chart
 #   extra-dep: true
 
-extra-deps: []
+extra-deps:
+    - easyplot-1.0
+    - vector-strategies-0.4
+    - time-1.9.1
 resolver: lts-9.0
+
+allow-newer: true

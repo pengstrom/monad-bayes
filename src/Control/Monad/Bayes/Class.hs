@@ -60,6 +60,8 @@ import Data.Vector.Generic as VG
 import qualified Data.Vector as V
 import Control.Monad (when)
 
+import Debug.Trace
+
 -- | Class of monads that can draw random variables.
 class Monad m => MonadSample m where
   -- | A random variable distributed uniformly on [0,1].
