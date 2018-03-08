@@ -94,7 +94,7 @@ ipmcmc n m r model = do
   logtime
   pnodes <- V.fromList <$> MP.replicateM p     smcnode'
   mnodes <- V.fromList <$> MP.replicateM (m-p) smcnode'
-  x' <- mcmcStep pnodes mnodes
+  x' <- mcmcStep pnodes mnodes -- 0 []
   let res = V.map (fromRight . fst . head) x'
       state = IPMCMCState m p r x' [res]  smcnode' csmcnode'
   ipmcmcHelper state
@@ -108,23 +108,54 @@ ipmcmcHelper state
       logtime
       pnodes <- V.fromList <$> MP.forM (V.toList $ conds state) (csmcnode state)
       mnodes <- V.fromList <$> MP.replicateM nonp (smcnode state)
-      --traceM $ "MCMC step = " ++ show (nummcmc state)
-      x' <- mcmcStep pnodes mnodes
+      traceM $ "MCMC step = " ++ show (nummcmc state)
+      x' <- mcmcStep pnodes mnodes -- 0 []
       let res = V.map (fromRight . fst . head) x' : result state
           nextr = nummcmc state - 1
           state' = state {nummcmc = nextr, conds = x', result = res}
       ipmcmcHelper state'
 
-mcmcStep :: MonadSample m => V.Vector (SMCState m a) -> V.Vector (SMCState m a) -> m (V.Vector (Trajectory m a))
-mcmcStep pnodes mnodes = do
-  let sumzm = V.sum $ V.map snd mnodes
-      weightsm = V.map (flip (/) sumzm . snd) mnodes
-  V.forM pnodes $ \(t,z) -> do
-    let weights = V.cons (z / (z + sumzm)) $ V.map (\x -> recip $ recip x + z / (x * sumzm)) weightsm
-    ksi <- logCategorical weights
-    let trajectory = maybe t fst $ mnodes V.!? ksi
-    b <- logCategorical $ normalizedw trajectory
-    return $ trajectory V.! b
+mcmcStep :: MonadSample m => V.Vector (SMCState m a) -> V.Vector (SMCState m a) {- -> Int -> [Trajectory m a] -} -> m (V.Vector (Trajectory m a))
+mcmcStep pnodes mnodes -- idx acc
+    {-
+  | idx == V.length pnodes = return $ V.fromList $ reverse acc
+  | otherwise = do
+    let ct = pnodes V.! idx
+    (node, mnodes') <- sampleNode ct mnodes
+    x <- sampleCond node
+    let idx' = idx + 1
+        acc' = x : acc
+    mcmcStep pnodes mnodes' idx' acc'
+      -}
+      = do
+    let sumzm = V.sum $ V.map snd mnodes
+        weightsm = V.map (flip (/) sumzm . snd) mnodes
+    V.forM pnodes $ \(t,z) -> do
+      let weights = V.snoc (V.map (\x -> recip $ recip x + z / (x * sumzm)) weightsm) (z / (z + sumzm))
+      ksi <- logCategorical weights
+      let trajectory = maybe t fst $ mnodes V.!? ksi
+      b <- logCategorical $ normalizedw trajectory
+      return $ trajectory V.! b
+
+sampleCond :: MonadSample m => SMCState m a -> m (Trajectory m a)
+sampleCond (t, _) = do
+  let ws = fmap (snd . head . tail) t
+      sumWs = V.sum ws
+      normWs = fmap (/sumWs) ws
+  b <- logCategorical normWs
+  return $ t V.! b
+
+sampleNode :: MonadSample m => SMCState m a -> V.Vector (SMCState m a) -> m (SMCState m a, V.Vector (SMCState m a))
+sampleNode ct mnodes = do
+  let ts = V.cons ct mnodes
+      zs = fmap snd ts
+      sumz = V.sum zs
+      normZs = fmap (/sumz) zs
+  ksi <- logCategorical normZs
+  let isCond = ksi == 0
+      node = ts V.! ksi
+      mnodes' = if isCond then mnodes else mnodes V.// [(ksi-1,node)]
+  return (node, mnodes')
 
 -- | Conditional Sequential Markov Chain sampler.
 -- Uses multinomial resampling.
@@ -202,7 +233,7 @@ toPopulation state = P.fromWeightedList weights
     f xs = (value xs, total xs)
     value ((Right x, _):_) = x
     value _                = error "Last trace not Right"
-    total = snd . head
+    total = snd . head . tail
 
 sampleAncestorWith ::
      MonadSample m
@@ -248,4 +279,5 @@ ipmcmcAvg f res = flip (/) (r * p) $ foldl (\acc v -> acc + V.foldl (\acc' x -> 
 logtime :: MonadIO m => m ()
 logtime = do
   (MkSystemTime secs msecs) <- liftIO getSystemTime
-  liftIO $ putStrLn $ show secs ++ "." ++ show msecs
+  return ()
+  --liftIO $ putStrLn $ show secs ++ "." ++ show msecs

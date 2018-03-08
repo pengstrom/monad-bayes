@@ -105,11 +105,10 @@ main
   now <- show <$> getCurrentTime
   let particles = 100
       nodes = 32
-      iters = 1000
+      iters = 2000
       filename =
-        printf "ipmcmc-speed-iters-%d-%d-%d_%s" particles nodes iters now
+        printf "ipmcmc-correctness-iters-%d-%d-%d_%s" particles nodes iters now
   res <- sampleIO $ ipmcmc particles nodes iters model
-  print $ length res
   let kls = reverse $ itersAccum (kl . ipmcmcToWeighted) res
   B.writeFile filename $ encode $ zip [1 :: Double ..] kls
   {-
