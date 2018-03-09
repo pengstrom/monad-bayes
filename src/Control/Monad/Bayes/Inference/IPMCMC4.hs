@@ -95,7 +95,8 @@ ipmcmc n m r model = do
   pnodesHandle <- forkExec $ V.fromList <$> MP.replicateM p     smcnode'
   mnodes <- V.fromList <$> MP.replicateM (m-p) smcnode'
   pnodes <- pnodesHandle
-  x' <- mcmcStep pnodes mnodes -- 0 []
+  x' <- mcmcStep pnodes mnodes 0 []
+  --x' <- mcmcStep pnodes mnodes
   let res = V.map (fromRight . fst . head) x'
       state = IPMCMCState m p (r-1) x' [res]  smcnode' csmcnode'
   ipmcmcHelper state
@@ -110,34 +111,38 @@ ipmcmcHelper state
       pnodesHandle <- forkExec $ V.fromList <$> MP.forM (V.toList $ conds state) (csmcnode state)
       mnodes <- V.fromList <$> MP.replicateM nonp (smcnode state)
       pnodes <- pnodesHandle
-      traceM $ "MCMC step = " ++ show (nummcmc state)
-      x' <- mcmcStep pnodes mnodes -- 0 []
+      --traceM $ "MCMC step = " ++ show (nummcmc state)
+      x' <- mcmcStep pnodes mnodes 0 []
+      --x' <- mcmcStep pnodes mnodes
       let res = V.map (fromRight . fst . head) x' : result state
           nextr = nummcmc state - 1
           state' = state {nummcmc = nextr, conds = x', result = res}
       ipmcmcHelper state'
 
-mcmcStep :: MonadSample m => V.Vector (SMCState m a) -> V.Vector (SMCState m a) {- -> Int -> [Trajectory m a] -} -> m (V.Vector (Trajectory m a))
-mcmcStep pnodes mnodes -- idx acc
-    {-
+mcmcStep :: MonadSample m => V.Vector (SMCState m a) -> V.Vector (SMCState m a) -> Int -> [Trajectory m a] -> m (V.Vector (Trajectory m a))
+mcmcStep pnodes mnodes idx acc
   | idx == V.length pnodes = return $ V.fromList $ reverse acc
   | otherwise = do
-    let ct = pnodes V.! idx
-    (node, mnodes') <- sampleNode ct mnodes
+    let current = pnodes V.! idx
+    (node, mnodes') <- sampleNode current mnodes
     x <- sampleCond node
     let idx' = idx + 1
         acc' = x : acc
     mcmcStep pnodes mnodes' idx' acc'
-      -}
+
+    {-
+mcmcStep :: MonadSample m => V.Vector (SMCState m a) -> V.Vector (SMCState m a) -> m (V.Vector (Trajectory m a))
+mcmcStep pnodes mnodes  | idx == V.length pnodes = return $ V.fromList $ reverse acc
       = do
     let sumzm = V.sum $ V.map snd mnodes
-        weightsm = V.map (flip (/) sumzm . snd) mnodes
+        weightsm = V.map ((/sumzm) . snd) mnodes
     V.forM pnodes $ \(t,z) -> do
       let weights = V.snoc (V.map (\x -> recip $ recip x + z / (x * sumzm)) weightsm) (z / (z + sumzm))
       ksi <- logCategorical weights
       let trajectory = maybe t fst $ mnodes V.!? ksi
       b <- logCategorical $ normalizedw trajectory
       return $ trajectory V.! b
+      -}
 
 sampleCond :: MonadSample m => SMCState m a -> m (Trajectory m a)
 sampleCond (t, _) = do
