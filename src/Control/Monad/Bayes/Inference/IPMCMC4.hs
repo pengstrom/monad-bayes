@@ -111,7 +111,7 @@ ipmcmcHelper state
       pnodesHandle <- forkExec $ V.fromList <$> MP.forM (V.toList $ conds state) (csmcnode state)
       mnodes <- V.fromList <$> MP.replicateM nonp (smcnode state)
       pnodes <- pnodesHandle
-      --traceM $ "MCMC step = " ++ show (nummcmc state)
+      traceM $ "MCMC step = " ++ show (nummcmc state)
       x' <- mcmcStep pnodes mnodes 0 []
       --x' <- mcmcStep pnodes mnodes
       let res = V.map (fromRight . fst . head) x' : result state
@@ -149,7 +149,11 @@ sampleCond (t, _) = do
   let ws = fmap (snd . head . tail) t
       sumWs = V.sum ws
       normWs = fmap (/sumWs) ws
-  b <- logCategorical normWs
+  --traceM $ "SampleCond: weights = " ++ show ws
+  --traceM $ "SampleCond: normWeights = " ++ show normWs
+  --b <- logCategorical normWs
+  let n = V.length t
+  b <- uniformD [0..n-1]
   return $ t V.! b
 
 sampleNode :: MonadSample m => SMCState m a -> V.Vector (SMCState m a) -> m (SMCState m a, V.Vector (SMCState m a))
@@ -158,7 +162,11 @@ sampleNode ct mnodes = do
       zs = fmap snd ts
       sumz = V.sum zs
       normZs = fmap (/sumz) zs
+  --traceM $ "SampleNode: zeights = " ++ show zs
+  --traceM $ "SampleNode: normZeights = " ++ show normZs
   ksi <- logCategorical normZs
+  --let n = V.length ts
+  --ksi <- uniformD [0..n-1]
   let isCond = ksi == 0
       node = ts V.! ksi
       mnodes' = if isCond then mnodes else mnodes V.// [(ksi-1,node)]
