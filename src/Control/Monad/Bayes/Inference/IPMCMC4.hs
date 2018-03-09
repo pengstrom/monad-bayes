@@ -81,7 +81,7 @@ instance MonadSample m => MonadInfer (Coroutine (Yield (Log Double)) m)
 -- Results are (at least explicitly) unweighted.
 -- The value M/2 is used for the number of conditional nodes.
 -- No Rao-Blackwell normalization.
-ipmcmc :: (MonadParallel m, MonadSample m, MonadIO m)
+ipmcmc :: (MonadFork m, MonadSample m, MonadIO m)
   => Int -- ^ Number of SMC particles per node N
   -> Int -- ^ Number of nodes M
   -> Int -- ^ Number of MCMC iterations
@@ -92,22 +92,24 @@ ipmcmc n m r model = do
       smcnode' = smc n model
       csmcnode' t = csmc t n model
   logtime
-  pnodes <- V.fromList <$> MP.replicateM p     smcnode'
+  pnodesHandle <- forkExec $ V.fromList <$> MP.replicateM p     smcnode'
   mnodes <- V.fromList <$> MP.replicateM (m-p) smcnode'
+  pnodes <- pnodesHandle
   x' <- mcmcStep pnodes mnodes -- 0 []
   let res = V.map (fromRight . fst . head) x'
-      state = IPMCMCState m p r x' [res]  smcnode' csmcnode'
+      state = IPMCMCState m p (r-1) x' [res]  smcnode' csmcnode'
   ipmcmcHelper state
 
-ipmcmcHelper :: (MonadIO m, MonadParallel m, MonadSample m) => IPMCMCState m a -> m (IPMCMCResult a)
+ipmcmcHelper :: (MonadIO m, MonadFork m, MonadSample m) => IPMCMCState m a -> m (IPMCMCResult a)
 ipmcmcHelper state
     | nummcmc state <= 0 = return $ result state
     | otherwise = do
       let p = numcond state
           nonp = numnodes state - p
       logtime
-      pnodes <- V.fromList <$> MP.forM (V.toList $ conds state) (csmcnode state)
+      pnodesHandle <- forkExec $ V.fromList <$> MP.forM (V.toList $ conds state) (csmcnode state)
       mnodes <- V.fromList <$> MP.replicateM nonp (smcnode state)
+      pnodes <- pnodesHandle
       traceM $ "MCMC step = " ++ show (nummcmc state)
       x' <- mcmcStep pnodes mnodes -- 0 []
       let res = V.map (fromRight . fst . head) x' : result state
