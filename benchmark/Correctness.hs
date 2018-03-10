@@ -28,6 +28,8 @@ import           Text.Printf
 
 import qualified Control.Monad.Parallel                as MP
 
+import           Criterion.Measurement
+
 model :: MonadInfer m => m Int
 model = dice_soft
 
@@ -88,12 +90,23 @@ onlysmc n m =
     return (x, 1 / fromIntegral m)
 
 smciters ::
-     (MonadSample m, MP.MonadParallel m)
+     (MonadIO m, MonadSample m, MP.MonadParallel m)
   => Int
   -> Int
   -> Int
   -> m [[(Int, Double)]]
-smciters n m r = replicateM r (onlysmc n m)
+smciters n m r =
+  forM [1 .. r] $ \i -> do
+    traceM $ "MCMC = " ++ show i
+    logtime
+    onlysmc n m
+
+logtime :: MonadIO m => m ()
+logtime = do
+  wtime <- liftIO $ show <$> getTime
+  ctime <- liftIO $ show <$> getCPUTime
+  liftIO $ putStrLn $ wtime ++ "," ++ ctime
+  return ()
 
 concatNorm :: [[(Int, Double)]] -> [(Int, Double)]
 concatNorm xs = map (\(x, w) -> (x, w / fromIntegral (length xs))) $ concat xs
@@ -102,10 +115,11 @@ main :: IO ()
 main
   --now <- show <$> getCurrentTime
  = do
+  initializeTime
   now <- show <$> getCurrentTime
   let particles = 100
       nodes = 32
-      iters = 2000
+      iters = 1000
       filename =
         printf "ipmcmc-correctness-iters-%d-%d-%d_%s" particles nodes iters now
   res <- sampleIO $ ipmcmc particles nodes iters model
