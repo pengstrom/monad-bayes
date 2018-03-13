@@ -111,6 +111,16 @@ logtime = do
 concatNorm :: [[(Int, Double)]] -> [(Int, Double)]
 concatNorm xs = map (\(x, w) -> (x, w / fromIntegral (length xs))) $ concat xs
 
+mean :: [Double] -> Double
+mean xs = sum $ map (/ n) xs
+  where
+    n = fromIntegral $ length xs
+
+transpose :: [[a]] -> [[a]]
+transpose xs
+  | (null . head) xs = []
+  | otherwise = map head xs : transpose (map tail xs)
+
 main :: IO ()
 main
   --now <- show <$> getCurrentTime
@@ -120,11 +130,21 @@ main
   let particles = 100
       nodes = 32
       iters = 1000
+      samples = 10
       filename =
-        printf "ipmcmc-correctness-iters-%d-%d-%d_%s" particles nodes iters now
-  res <- sampleIO $ ipmcmc particles nodes iters model
-  let kls = reverse $ itersAccum (kl . ipmcmcToWeighted) res
-  B.writeFile filename $ encode $ zip [1 :: Double ..] kls
+        printf
+          "ipmcmc-correctness-iters%d-%d-%d-%d_%s"
+          samples
+          particles
+          nodes
+          iters
+          now
+  (kl, kls) <-
+    sampleIO $ do
+      res <- MP.replicateM samples $ ipmcmc particles nodes iters model
+      let x = transpose $ map (reverse . itersAccum (kl . ipmcmcToWeighted)) res
+      return (map mean x, x)
+  B.writeFile filename $ encode kls
   {-
       filename = printf "memsmash-ipmcmc_%s" now
   samples <-
