@@ -78,7 +78,31 @@ simulate particles alg =
     particles
     (\p -> do
        traceM $ "N = " ++ show p
-       explicitPopulation $ normalize $ alg p model)
+       pop <- explicitPopulation $ normalize $ alg p model
+       logtime
+       return pop)
+
+benchsmc :: MonadSample m => Int -> Int -> m [Double]
+benchsmc n k = do
+  let sampler = explicitPopulation $ normalize $ smcMultinomial 2 n model
+      samples = replicateM k sampler
+  map (kl . weightedToMap) <$> samples
+
+benchsmcs :: (MonadSample m, MonadIO m) => Int -> [Int] -> m [[Double]]
+benchsmcs k particles =
+  forM particles $ \n -> do
+    traceM $ "Benchmarking n = " ++ show n
+    (x, b) <- timebench (benchsmc n k)
+    let p = fromIntegral n
+        a = b / fromIntegral k
+    return (p : a : x)
+
+timebench :: MonadIO m => m a -> m (a, Double)
+timebench m = do
+  start <- liftIO getTime
+  x <- m
+  end <- liftIO getTime
+  return (x, end - start)
 
 onlysmc ::
      (MP.MonadParallel m, MonadSample m) => Int -> Int -> m [(Int, Double)]
@@ -127,10 +151,16 @@ main
  = do
   initializeTime
   now <- show <$> getCurrentTime
-  let particles = 100
-      nodes = 32
-      iters = 1000
+  let particles = [2 ^ x | x <- [0 .. pmax]]
+      pmax = floor $ logBase 2 10000
+      --nodes = 32
+      --iters = 1000
       samples = 10
+      filename = printf "smc-particles-%d_%s.csv" samples now
+  traceM $ show pmax
+  kls <- sampleIO $ benchsmcs samples particles
+  B.writeFile filename $ encode kls
+  {-
       filename =
         printf
           "ipmcmc-correctness-iters%d-%d-%d-%d_%s"
@@ -144,8 +174,6 @@ main
       res <- MP.replicateM samples $ ipmcmc particles nodes iters model
       let x = transpose $ map (reverse . itersAccum (kl . ipmcmcToWeighted)) res
       return (map mean x, x)
-  B.writeFile filename $ encode kls
-  {-
       filename = printf "memsmash-ipmcmc_%s" now
   samples <-
     sampleIO $ do
